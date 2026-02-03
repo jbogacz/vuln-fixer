@@ -1,0 +1,5 @@
+# No external dependencies for GitLab - using glab CLI
+# No external dependencies for AI - using Claude CLI
+
+click>=8.0.0
+pyyaml>=6.0

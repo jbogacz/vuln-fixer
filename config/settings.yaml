@@ -1,0 +1,33 @@
+# Vuln-Fixer Configuration
+#
+# GitLab project is AUTO-DETECTED from the repository's git remote URL.
+# No need to configure project path manually!
+
+gitlab:
+  # Target branch for merge requests (default: main)
+  target_branch: main
+
+agent:
+  # Timeout in seconds for Claude CLI operations
+  timeout: 300
+
+  # Max agent loop iterations
+  max_turns: 10
+
+options:
+  # Automatically create MRs after fixing
+  auto_create_mr: true
+
+  # Only analyze, don't make changes (can override with --dry-run flag)
+  dry_run: false
+
+  # Only process vulnerabilities with these severities
+  severity_filter:
+    - critical
+    - high
+
+  # Maximum vulnerabilities to fix in batch mode
+  max_fixes_per_run: 10
+
+  # Minimum confidence score to accept a fix (0.0-1.0)
+  min_confidence: 0.7

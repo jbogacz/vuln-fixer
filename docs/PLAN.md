@@ -85,30 +85,60 @@ glab auth login
 |---------|-------------|
 | `info` | Show detected GitLab project from repo |
 | `list` | List vulnerabilities (filtered by severity) |
-| `fix <id>` | Fix a specific vulnerability |
-| `fix-all` | Batch fix vulnerabilities |
+| `fix <id> <jira>` | Fix a specific vulnerability |
+| `list-groups` | List vulnerabilities grouped by CVE or package |
+| `fix-group <cve> <jira>` | Fix all vulnerabilities for a CVE in one MR |
+| `fix-all-groups <jira-prefix>` | Fix all CVE groups, one MR per CVE |
 
 ### Examples
 
 ```bash
 # Show detected project info
-python -m src.main -r /path/to/repo info
+vuln-fixer -r /path/to/repo info
 
 # List high and critical vulnerabilities
-python -m src.main -r /path/to/repo list
+vuln-fixer -r /path/to/repo list
 
 # List all severities
-python -m src.main -r /path/to/repo list -s critical -s high -s medium -s low
+vuln-fixer -r /path/to/repo list -s critical -s high -s medium -s low
 
 # Analyze a vulnerability without making changes
-python -m src.main -r /path/to/repo fix 12345 --dry-run
+vuln-fixer -r /path/to/repo fix 12345 SEC-789 --dry-run
 
 # Fix and create MR
-python -m src.main -r /path/to/repo fix 12345
+vuln-fixer -r /path/to/repo fix 12345 SEC-789
 
-# Batch fix up to 5 critical vulnerabilities
-python -m src.main -r /path/to/repo fix-all -s critical -m 5
+# Local only (don't push or create MR)
+vuln-fixer -r /path/to/repo fix 12345 SEC-789 --local-only
+
+# Force override existing branch/MR (if you own it)
+vuln-fixer -r /path/to/repo fix 12345 SEC-789 --force
 ```
+
+### Batch Processing (CVE Grouping)
+
+```bash
+# List vulnerabilities grouped by CVE
+vuln-fixer -r /path/to/repo list-groups
+
+# List grouped by package
+vuln-fixer -r /path/to/repo list-groups --group-by package
+
+# Fix all vulnerabilities for a specific CVE
+vuln-fixer -r /path/to/repo fix-group CVE-2024-12798 SEC-800 --dry-run
+vuln-fixer -r /path/to/repo fix-group CVE-2024-12798 SEC-800
+
+# Fix ALL CVE groups at once (one MR per CVE)
+vuln-fixer -r /path/to/repo fix-all-groups SEC-900 --dry-run
+vuln-fixer -r /path/to/repo fix-all-groups SEC-900
+
+# Limit to first N groups
+vuln-fixer -r /path/to/repo fix-all-groups SEC-900 --max-groups 5
+```
+
+**Benefits:** Reduces MR count significantly (e.g., 20 vulnerabilities → 9 MRs when grouped by CVE).
+
+**Note:** Batch processing ALWAYS groups by CVE - it will never create one MR per vulnerability.
 
 ---
 
@@ -209,13 +239,22 @@ options:
 - [x] Dry-run mode
 - [x] Dependency fixes
 
-### Phase 3: Code Style Consistency
+### Phase 3: Code Style Consistency ✅
 - [x] Prompt-based style matching (simplest approach)
+- [x] Explicit "DO NOT introduce new patterns" instructions
 - [ ] Post-fix linting/formatting (black, prettier, etc.)
 - [ ] Review agent (gatekeeper for style validation)
 
-### Phase 4: Automation
-- [ ] Batch processing improvements
+### Phase 4: Batch Processing ✅
+- [x] Group vulnerabilities by CVE
+- [x] Group vulnerabilities by package
+- [x] `list-groups` command
+- [x] `fix-group` command for CVE-based batch fixes
+- [x] `fix-all-groups` command for processing all CVEs at once
+- [x] Smart transitive dependency detection
+- [x] False positive detection (identifies already-patched dependencies)
+
+### Phase 5: Automation
 - [ ] CI/CD integration
 - [ ] Fix validation (run tests)
 - [ ] Reporting and metrics
@@ -243,3 +282,23 @@ A separate validation pass that:
 1. Compares fix style against codebase patterns
 2. Flags inconsistencies
 3. Optionally auto-corrects or rejects
+
+---
+
+## Batch Processing (CVE Grouping)
+
+Instead of creating one MR per vulnerability, group related vulnerabilities:
+
+### Grouping Strategies
+
+| Strategy | Use Case | Example |
+|----------|----------|---------|
+| **By CVE** | Same vulnerability across modules | CVE-2024-12798 affects 5 modules → 1 MR |
+| **By Package** | Same package in multiple files | logback-core in 3 files → 1 MR |
+
+### Smart Detection
+
+The agent intelligently handles:
+- **Transitive dependencies**: Finds the actual source, not just flagged files
+- **Centralized fixes**: Uses root build.gradle.kts when appropriate
+- **Consistent changes**: Applies same fix pattern across all affected files

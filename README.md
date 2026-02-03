@@ -96,6 +96,42 @@ The `--force` flag will:
 
 **Safety:** Force only works if you are the author of the existing MR. If someone else owns it, the command will fail with an error showing the actual owner.
 
+### Batch processing (group by CVE)
+
+Instead of creating one MR per vulnerability, group them by CVE:
+
+```bash
+# List vulnerabilities grouped by CVE
+vuln-fixer -r /path/to/your/repo list-groups
+
+# List grouped by package instead
+vuln-fixer -r /path/to/your/repo list-groups --group-by package
+
+# Fix all vulnerabilities for a specific CVE in one MR
+vuln-fixer -r /path/to/your/repo fix-group CVE-2024-12798 SEC-800 --dry-run
+vuln-fixer -r /path/to/your/repo fix-group CVE-2024-12798 SEC-800
+
+# Fix ALL CVE groups at once (one MR per CVE)
+vuln-fixer -r /path/to/your/repo fix-all-groups SEC-900 --dry-run
+vuln-fixer -r /path/to/your/repo fix-all-groups SEC-900
+
+# Limit to first N groups
+vuln-fixer -r /path/to/your/repo fix-all-groups SEC-900 --max-groups 5
+```
+
+This reduces the number of MRs significantly. For example:
+- 20 vulnerabilities across 9 CVEs → 9 MRs instead of 20
+
+**Note:** Batch processing ALWAYS groups by CVE - it will never create one MR per vulnerability.
+
+### Local-only mode
+```bash
+# Create local branch only, don't push or create MR
+vuln-fixer -r /path/to/your/repo fix 12345 SEC-789 --local-only
+```
+
+Useful for reviewing changes locally before pushing.
+
 ## How It Works
 
 ```

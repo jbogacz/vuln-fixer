@@ -315,6 +315,93 @@ Provide:
             files_modified=result.files_modified
         )
 
+    def fix_cve_group(
+        self,
+        cve: str,
+        vulns: list,
+        repo_path: Path,
+        dry_run: bool = False
+    ) -> Fix | None:
+        """
+        Fix all vulnerabilities in a CVE group at once.
+
+        Args:
+            cve: The CVE identifier
+            vulns: List of vulnerabilities sharing this CVE
+            repo_path: Path to the local repository
+            dry_run: If True, only analyze without making changes
+
+        Returns:
+            Fix object with results, or None if failed
+        """
+        action = "analyze" if dry_run else "fix"
+
+        # Build list of affected files
+        files_info = "\n".join(
+            f"- {v.location.file_path} (package: {v.location.dependency or 'unknown'})"
+            for v in vulns
+        )
+
+        # Use first vulnerability for details
+        first_vuln = vulns[0]
+
+        prompt = f"""
+You are a security expert. {action.capitalize()} this CVE across ALL affected files:
+
+## CVE Details
+- **CVE**: {cve}
+- **Title**: {first_vuln.title}
+- **Severity**: {first_vuln.severity.value}
+- **Description**: {first_vuln.description}
+- **Solution**: {first_vuln.solution or 'Upgrade to patched version'}
+
+## Affected Files ({len(vulns)} locations)
+{files_info}
+
+## Instructions
+
+### Step 1: Analyze Dependency File Style (CRITICAL)
+Before making changes, read the dependency files to identify:
+- Version pinning style (exact: "1.2.3", range: "^1.2.3", ">=1.2.3")
+- How dependencies are declared (string literals vs version catalogs vs variables)
+- Formatting and organization of dependencies
+
+### Step 2: Fix ALL Affected Files
+1. Read each affected file listed above
+2. {"Explain the required changes" if dry_run else "Update each file to use the safe version"}
+3. Apply the SAME fix pattern to all files
+4. Only change the specific package version in each file
+
+### Step 3: Match Existing Style (MANDATORY)
+Your fix MUST match the existing dependency file style EXACTLY:
+- If other dependencies use string literals like "group:artifact:version", you MUST use the same format
+- If other dependencies use version catalogs (libs.xxx), then use version catalogs
+- DO NOT introduce new patterns, abstractions, or "best practices" that don't exist in the files
+- DO NOT add entries to version catalog files (libs.versions.toml) unless the project already uses them for similar dependencies
+- The goal is MINIMAL change - only add/change the version number, nothing else
+
+Provide:
+- EXPLANATION: What changes {"are needed" if dry_run else "were made"} across all files
+- CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
+"""
+
+        result = self._run_claude(prompt, repo_path)
+
+        if not result.success:
+            print(f"Claude CLI error: {result.error}")
+            return None
+
+        explanation, confidence = self._parse_output(result.output)
+
+        return Fix(
+            file_path=f"{cve} ({len(vulns)} files)",
+            original_content="",
+            fixed_content="",
+            explanation=explanation,
+            confidence=confidence,
+            files_modified=result.files_modified
+        )
+
     def _parse_output(self, output: str) -> tuple[str, float]:
         """
         Parse Claude's output to extract explanation and confidence.

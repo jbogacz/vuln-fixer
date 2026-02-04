@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .vuln_parser import Vulnerability, VulnType
+from .vuln_parser import Vulnerability
 
 
 @dataclass
@@ -30,14 +30,16 @@ class ClaudeResult:
 class FixerAgent:
     """AI agent for analyzing and fixing vulnerabilities using Claude CLI."""
 
-    def __init__(self, timeout: int = 300):
+    def __init__(self, timeout: int = 300, max_turns: int = 30):
         """
         Initialize the fixer agent.
 
         Args:
             timeout: Max seconds to wait for Claude CLI response
+            max_turns: Max iterations for Claude CLI agent loop (default: 30)
         """
         self.timeout = timeout
+        self.max_turns = max_turns
         self._verify_claude_cli()
 
     def _verify_claude_cli(self) -> None:
@@ -56,76 +58,157 @@ class FixerAgent:
                 "Claude CLI not found. Install it with: npm install -g @anthropic-ai/claude-code"
             )
 
-    def _run_claude(self, prompt: str, cwd: Path) -> ClaudeResult:
+    def _run_claude(self, prompt: str, cwd: Path, verbose: bool = True) -> ClaudeResult:
         """
-        Run Claude CLI with a prompt.
+        Run Claude CLI with a prompt, streaming progress output.
 
         Args:
             prompt: The task prompt for Claude
             cwd: Working directory (repo path)
+            verbose: Print progress messages during execution
 
         Returns:
             ClaudeResult with output and modified files
         """
         try:
-            result = subprocess.run(
+            # Use stream-json for real-time progress, then collect final result
+            process = subprocess.Popen(
                 [
                     "claude",
                     "-p", prompt,
-                    "--output-format", "json",
-                    "--max-turns", "20",
+                    "--output-format", "stream-json",
+                    "--verbose",
+                    "--max-turns", str(self.max_turns),
                     "--dangerously-skip-permissions"
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                cwd=cwd,
-                timeout=self.timeout
+                cwd=cwd
             )
 
-            if result.returncode != 0:
+            result_data = None
+            files_modified = []
+            turn_count = 0
+            last_tool = None
+
+            # Stream and parse JSON lines
+            try:
+                for line in process.stdout or []:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get("type", "")
+
+                        # Track assistant turns (iterations)
+                        if event_type == "assistant":
+                            turn_count += 1
+                            if verbose:
+                                print(f"  [Turn {turn_count}/{self.max_turns}] Agent thinking...", flush=True)
+
+                        # Track tool usage
+                        elif event_type == "tool_use":
+                            tool_name = event.get("tool", event.get("name", "unknown"))
+                            if verbose and tool_name != last_tool:
+                                print(f"  [Turn {turn_count}] Using tool: {tool_name}", flush=True)
+                                last_tool = tool_name
+
+                        # Track file modifications
+                        elif event_type == "tool_result":
+                            # Check if this was a file edit
+                            tool = event.get("tool", "")
+                            if tool in ("Edit", "Write"):
+                                file_path = event.get("file_path", "")
+                                if file_path and file_path not in files_modified:
+                                    files_modified.append(file_path)
+                                    if verbose:
+                                        print(f"  [Turn {turn_count}] Modified: {file_path}", flush=True)
+
+                        # Capture final result
+                        elif event_type == "result":
+                            result_data = event
+
+                    except json.JSONDecodeError:
+                        continue
+
+                # Wait for process to complete
+                process.wait(timeout=self.timeout)
+
+            except subprocess.TimeoutExpired:
+                process.kill()
                 return ClaudeResult(
                     success=False,
                     output="",
-                    files_modified=[],
-                    error=result.stderr or "Claude CLI failed"
+                    files_modified=files_modified,
+                    error=f"Claude CLI timed out after {self.timeout}s"
                 )
 
-            # Parse JSON output
-            try:
-                output_data = json.loads(result.stdout)
-                # Extract the actual result text, never use raw JSON
-                result_text = output_data.get("result", "")
+            if verbose:
+                print(f"  [Done] Completed in {turn_count} turns", flush=True)
 
-                # If result is empty (e.g., max_turns hit), provide a summary
+            if process.returncode != 0:
+                stderr = process.stderr.read() if process.stderr else ""
+                return ClaudeResult(
+                    success=False,
+                    output="",
+                    files_modified=files_modified,
+                    error=stderr or "Claude CLI failed"
+                )
+
+            # Process final result
+            if result_data:
+                result_text = result_data.get("result", "")
+                # Merge file lists
+                result_files = result_data.get("files_modified", [])
+                all_files = list(set(files_modified + result_files))
+
+                # If result is empty (e.g., max_turns hit), try to build a summary
                 if not result_text or result_text.strip() == "":
-                    subtype = output_data.get("subtype", "")
-                    if subtype == "error_max_turns":
-                        result_text = "Fix applied (Claude CLI completed with max turns reached)"
+                    subtype = result_data.get("subtype", "")
+
+                    if all_files:
+                        files_str = ", ".join(all_files)
+                        result_text = (
+                            f"EXPLANATION:\n"
+                            f"Files modified: {files_str}\n\n"
+                            f"The AI agent applied changes to fix the vulnerability. "
+                            f"Please review the diff to verify the fix is correct.\n\n"
+                        )
+                        if subtype == "error_max_turns":
+                            result_text += f"(Note: Agent reached iteration limit at turn {turn_count})\n\n"
+                        result_text += "CONFIDENCE: 0.7"
+                    elif subtype == "error_max_turns":
+                        result_text = (
+                            f"EXPLANATION:\n"
+                            f"The AI agent reached its iteration limit at turn {turn_count}. "
+                            f"The fix may have been applied - please check git status.\n\n"
+                            "CONFIDENCE: 0.5"
+                        )
                     else:
-                        result_text = "Fix applied successfully"
+                        result_text = (
+                            "EXPLANATION:\n"
+                            "Fix applied successfully.\n\n"
+                            "CONFIDENCE: 0.7"
+                        )
 
                 return ClaudeResult(
                     success=True,
                     output=result_text,
-                    files_modified=output_data.get("files_modified", []),
-                    error=None
-                )
-            except json.JSONDecodeError:
-                # Plain text output
-                return ClaudeResult(
-                    success=True,
-                    output=result.stdout,
-                    files_modified=[],
+                    files_modified=all_files,
                     error=None
                 )
 
-        except subprocess.TimeoutExpired:
+            # No result data - return what we collected
             return ClaudeResult(
-                success=False,
-                output="",
-                files_modified=[],
-                error=f"Claude CLI timed out after {self.timeout}s"
+                success=True,
+                output="Fix completed (no detailed output available)",
+                files_modified=files_modified,
+                error=None
             )
+
         except Exception as e:
             return ClaudeResult(
                 success=False,

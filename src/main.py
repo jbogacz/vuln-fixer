@@ -188,18 +188,29 @@ def build_mr_details(
             f"\n"
         )
 
+    # Build solution text with context for dependency vulnerabilities
+    if vuln.vuln_type.value == "dependency" and vuln.location.dependency:
+        solution_text = (
+            f"**Type:** Dependency vulnerability  \n"
+            f"**Package:** `{vuln.location.dependency}`  \n"
+            f"**Action:** {vuln.solution or 'Upgrade to patched version'}"
+        )
+    else:
+        solution_text = vuln.solution or 'Apply security patch'
+
     description = (
         f"## Security Fix\n"
         f"\n"
         f"**Vulnerability:** {vuln.title}  \n"
         f"**Severity:** {vuln.severity.value}  \n"
+        f"**Type:** {vuln.vuln_type.value}  \n"
         f"{confidence_line}"
         f"\n"
         f"### Description\n"
         f"{vuln.description}\n"
         f"\n"
         f"### Solution\n"
-        f"{vuln.solution or 'Upgrade to patched version'}\n"
+        f"{solution_text}\n"
         f"\n"
         f"{analysis_section}"
         f"---\n"
@@ -251,7 +262,10 @@ def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only):
 
     parser = VulnParser()
     agent_config = config.get("agent", {})
-    agent = FixerAgent(timeout=agent_config.get("timeout", 300))
+    agent = FixerAgent(
+        timeout=agent_config.get("timeout", 300),
+        max_turns=agent_config.get("max_turns", 30)
+    )
 
     # Find the vulnerability
     click.echo(f"Looking for vulnerability {vuln_id}...")
@@ -339,12 +353,15 @@ def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only):
             click.echo(f"Deleting local branch '{branch_name}'...")
             gl_client.delete_local_branch(branch_name, force=True)
 
-    # Step 2: Checkout target branch and pull latest
+    # Step 2: Checkout target branch and hard reset to remote
     click.echo(f"\nUpdating {target_branch} branch...")
     try:
         subprocess.run(["git", "fetch", "origin", target_branch], cwd=repo_path, check=True, capture_output=True)
         subprocess.run(["git", "checkout", target_branch], cwd=repo_path, check=True, capture_output=True)
-        subprocess.run(["git", "pull", "origin", target_branch], cwd=repo_path, check=True, capture_output=True)
+        # Hard reset to ensure local matches remote exactly (not just merge)
+        subprocess.run(["git", "reset", "--hard", f"origin/{target_branch}"], cwd=repo_path, check=True, capture_output=True)
+        # Clean untracked files that might interfere
+        subprocess.run(["git", "clean", "-fd"], cwd=repo_path, check=True, capture_output=True)
     except Exception as e:
         click.echo(f"Error: Could not update {target_branch}: {e}")
         return
@@ -475,6 +492,9 @@ def build_group_mr_details(
     # List all affected files
     files_list = "\n".join(f"- {v.location.file_path}" for v in vulns)
 
+    # Get unique packages affected
+    packages = list(set(v.location.dependency for v in vulns if v.location.dependency))
+
     # Include agent's detailed analysis if available
     analysis_section = ""
     if explanation:
@@ -484,12 +504,24 @@ def build_group_mr_details(
             f"\n"
         )
 
+    # Build solution text with context for dependency vulnerabilities
+    if first_vuln.vuln_type.value == "dependency" and packages:
+        packages_str = ", ".join(f"`{p}`" for p in packages)
+        solution_text = (
+            f"**Type:** Dependency vulnerability  \n"
+            f"**Package(s):** {packages_str}  \n"
+            f"**Action:** {first_vuln.solution or 'Upgrade to patched version'}"
+        )
+    else:
+        solution_text = first_vuln.solution or 'Apply security patch'
+
     description = (
         f"## Security Fix\n"
         f"\n"
         f"**CVE:** {cve}  \n"
         f"**Vulnerability:** {first_vuln.title}  \n"
         f"**Severity:** {first_vuln.severity.value}  \n"
+        f"**Type:** {first_vuln.vuln_type.value}  \n"
         f"**Affected files:** {len(vulns)}  \n"
         f"{confidence_line}"
         f"\n"
@@ -500,7 +532,7 @@ def build_group_mr_details(
         f"{first_vuln.description}\n"
         f"\n"
         f"### Solution\n"
-        f"{first_vuln.solution or 'Upgrade to patched version'}\n"
+        f"{solution_text}\n"
         f"\n"
         f"{analysis_section}"
         f"---\n"
@@ -595,7 +627,10 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
 
     parser = VulnParser()
     agent_config = config.get("agent", {})
-    agent = FixerAgent(timeout=agent_config.get("timeout", 300))
+    agent = FixerAgent(
+        timeout=agent_config.get("timeout", 300),
+        max_turns=agent_config.get("max_turns", 30)
+    )
 
     # Fetch and filter vulnerabilities
     raw_vulns = gl_client.get_vulnerability_report()
@@ -620,7 +655,7 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
 
     # For dry-run, we can run Claude on current branch (just analysis)
     if dry_run:
-        click.echo(f"\nInvoking Claude CLI to analyze...")
+        click.echo("\nInvoking Claude CLI to analyze...")
         fix_result = agent.fix_cve_group(cve, group, repo_path, dry_run=True)
 
         if not fix_result:
@@ -690,12 +725,15 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
             click.echo(f"Deleting local branch '{branch_name}'...")
             gl_client.delete_local_branch(branch_name, force=True)
 
-    # Step 2: Checkout target branch and pull latest
+    # Step 2: Checkout target branch and hard reset to remote
     click.echo(f"\nUpdating {target_branch} branch...")
     try:
         subprocess.run(["git", "fetch", "origin", target_branch], cwd=repo_path, check=True, capture_output=True)
         subprocess.run(["git", "checkout", target_branch], cwd=repo_path, check=True, capture_output=True)
-        subprocess.run(["git", "pull", "origin", target_branch], cwd=repo_path, check=True, capture_output=True)
+        # Hard reset to ensure local matches remote exactly (not just merge)
+        subprocess.run(["git", "reset", "--hard", f"origin/{target_branch}"], cwd=repo_path, check=True, capture_output=True)
+        # Clean untracked files that might interfere
+        subprocess.run(["git", "clean", "-fd"], cwd=repo_path, check=True, capture_output=True)
     except Exception as e:
         click.echo(f"Error: Could not update {target_branch}: {e}")
         return
@@ -707,7 +745,7 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
         return
 
     # Step 4: NOW run Claude on the clean branch
-    click.echo(f"\nInvoking Claude CLI to fix...")
+    click.echo("\nInvoking Claude CLI to fix...")
     fix_result = agent.fix_cve_group(cve, group, repo_path, dry_run=False)
 
     if not fix_result:

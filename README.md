@@ -201,6 +201,7 @@ gitlab:
 
 agent:
   timeout: 300             # Claude CLI timeout (seconds)
+  max_turns: 30            # Max iterations for AI agent (increase for complex fixes)
 
 options:
   min_confidence: 0.7      # Reject fixes below this confidence

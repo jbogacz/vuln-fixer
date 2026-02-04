@@ -1,6 +1,7 @@
 """AI-powered vulnerability fixer using Claude CLI."""
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -261,15 +262,25 @@ After {"analyzing" if dry_run else "fixing"}, provide:
         """
         action = "analyze" if dry_run else "fix"
 
+        package_name = vuln.location.dependency or 'unknown'
+        identifiers = ', '.join(vuln.identifiers)
+
         prompt = f"""
 You are a security expert. {action.capitalize()} this dependency vulnerability:
 
 ## Vulnerability Details
-- **Package**: {vuln.location.dependency or 'unknown'}
-- **Identifiers**: {', '.join(vuln.identifiers)}
+- **Package**: {package_name}
+- **Identifiers**: {identifiers}
 - **Severity**: {vuln.severity.value}
 - **Description**: {vuln.description}
 - **Solution**: {vuln.solution or 'Upgrade to patched version'}
+
+## CRITICAL: Scope Limitation
+You are ONLY fixing the vulnerability in package: {package_name}
+- DO NOT fix any other vulnerabilities or packages
+- DO NOT update any other dependencies, even if they appear vulnerable
+- ONLY modify the {package_name} package
+- If you see other vulnerabilities, IGNORE them - they will be fixed separately
 
 ## Instructions
 
@@ -279,11 +290,11 @@ Before making changes, read the dependency file to identify:
 - How dependencies are declared (string literals vs version catalogs vs variables)
 - Formatting and organization of dependencies
 
-### Step 2: Fix the Vulnerability
+### Step 2: Fix ONLY the {package_name} Vulnerability
 1. Find the dependency file (requirements.txt, package.json, pyproject.toml, build.gradle.kts, pom.xml, etc.)
-2. Locate the vulnerable package
+2. Locate the {package_name} package
 3. {"Explain the required version change" if dry_run else "Update to a safe version"}
-4. Only change the specific package version
+4. ONLY change the {package_name} version - nothing else
 
 ### Step 3: Match Existing Style (MANDATORY)
 Your fix MUST match the existing dependency file style EXACTLY:
@@ -345,6 +356,10 @@ Provide:
         # Use first vulnerability for details
         first_vuln = vulns[0]
 
+        # Extract the specific package name(s) for this CVE
+        packages = list(set(v.location.dependency for v in vulns if v.location.dependency))
+        packages_str = ", ".join(packages) if packages else "unknown"
+
         prompt = f"""
 You are a security expert. {action.capitalize()} this CVE across ALL affected files:
 
@@ -354,9 +369,17 @@ You are a security expert. {action.capitalize()} this CVE across ALL affected fi
 - **Severity**: {first_vuln.severity.value}
 - **Description**: {first_vuln.description}
 - **Solution**: {first_vuln.solution or 'Upgrade to patched version'}
+- **Affected Package(s)**: {packages_str}
 
 ## Affected Files ({len(vulns)} locations)
 {files_info}
+
+## CRITICAL: Scope Limitation
+You are ONLY fixing {cve} which affects the package(s): {packages_str}
+- DO NOT fix any other vulnerabilities or CVEs
+- DO NOT update any other packages, even if they appear vulnerable
+- ONLY modify the specific package(s) listed above
+- If you see other vulnerabilities, IGNORE them - they will be fixed separately
 
 ## Instructions
 
@@ -366,11 +389,11 @@ Before making changes, read the dependency files to identify:
 - How dependencies are declared (string literals vs version catalogs vs variables)
 - Formatting and organization of dependencies
 
-### Step 2: Fix ALL Affected Files
+### Step 2: Fix ONLY the Affected Package in ALL Listed Files
 1. Read each affected file listed above
 2. {"Explain the required changes" if dry_run else "Update each file to use the safe version"}
 3. Apply the SAME fix pattern to all files
-4. Only change the specific package version in each file
+4. ONLY change the {packages_str} package version - nothing else
 
 ### Step 3: Match Existing Style (MANDATORY)
 Your fix MUST match the existing dependency file style EXACTLY:
@@ -415,27 +438,23 @@ Provide:
         explanation = output
         confidence = 0.7  # Default confidence
 
-        # Try to extract structured parts
-        if "EXPLANATION:" in output:
-            parts = output.split("EXPLANATION:")
-            if len(parts) > 1:
-                explanation_part = parts[1]
-                if "CONFIDENCE:" in explanation_part:
-                    explanation = explanation_part.split("CONFIDENCE:")[0].strip()
-                else:
-                    explanation = explanation_part.strip()
+        # Try to extract EXPLANATION section (handles both "EXPLANATION:" and "## EXPLANATION")
+        explanation_match = re.search(
+            r"(?:#{1,3}\s*)?EXPLANATION[:\s]*\n*(.*?)(?=(?:#{1,3}\s*)?CONFIDENCE|\Z)",
+            output,
+            re.IGNORECASE | re.DOTALL
+        )
+        if explanation_match:
+            explanation = explanation_match.group(1).strip()
 
-        if "CONFIDENCE:" in output:
+        # Look for CONFIDENCE with or without colon (Claude may format as "## CONFIDENCE" or "CONFIDENCE:")
+        conf_match = re.search(r"CONFIDENCE[:\s]*\n*\s*\**(\d+\.?\d*)", output, re.IGNORECASE)
+        if conf_match:
             try:
-                conf_part = output.split("CONFIDENCE:")[1]
-                # Extract first number found
-                import re
-                match = re.search(r"(\d+\.?\d*)", conf_part)
-                if match:
-                    confidence = float(match.group(1))
-                    if confidence > 1:
-                        confidence = confidence / 100  # Handle percentage
-            except (IndexError, ValueError):
+                confidence = float(conf_match.group(1))
+                if confidence > 1:
+                    confidence = confidence / 100  # Handle percentage
+            except ValueError:
                 pass
 
         return explanation, min(max(confidence, 0.0), 1.0)

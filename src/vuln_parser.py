@@ -14,6 +14,40 @@ class Severity(Enum):
 
 
 class VulnType(Enum):
+    """
+    Vulnerability type, derived from GitLab's "report_type" field.
+
+    GitLab calls it "report_type" because vulnerabilities are discovered through
+    different security scanning jobs in CI/CD pipelines. Each scanner produces
+    a report artifact (e.g., gl-dependency-scanning-report.json), and the
+    "report_type" indicates which scanner/report the finding originated from.
+
+    Types:
+        DEPENDENCY: From "dependency_scanning" reports.
+            Scans package manifests (requirements.txt, package.json, pom.xml,
+            build.gradle.kts, etc.) for known vulnerable library versions.
+            Fix strategy: upgrade package version in the manifest file.
+
+        SAST: From "sast" (Static Application Security Testing) reports.
+            Analyzes source code for vulnerabilities like SQL injection, XSS,
+            insecure crypto, etc. without executing the application.
+            Fix strategy: modify the vulnerable code pattern.
+
+        DAST: From "dast" (Dynamic Application Security Testing) reports.
+            Tests running applications by sending malicious requests to find
+            vulnerabilities like injection flaws, auth issues, misconfigurations.
+            Fix strategy: modify code/config to prevent the detected attack vector.
+
+        SECRET: From "secret_detection" reports.
+            Scans code and git history for exposed secrets like API keys,
+            passwords, tokens, and certificates.
+            Fix strategy: remove/rotate the secret, use env vars or vaults.
+
+        CONTAINER: From "container_scanning" reports.
+            Scans Docker images for OS-level package vulnerabilities in the
+            base image or installed packages.
+            Fix strategy: update base image or packages in Dockerfile.
+    """
     DEPENDENCY = "dependency"
     SAST = "sast"
     DAST = "dast"
@@ -134,14 +168,21 @@ class VulnParser:
             return Severity.UNKNOWN
 
     def _parse_vuln_type(self, report_type: str) -> VulnType:
-        """Parse report type to vulnerability type enum."""
+        """
+        Parse GitLab report_type string to VulnType enum.
+
+        Maps GitLab's scanner report types (from the "report_type" field in
+        vulnerability_findings API response) to internal VulnType enum values.
+        """
+        # GitLab report_type values from CI security scanner artifacts
         mapping = {
-            "dependency_scanning": VulnType.DEPENDENCY,
-            "sast": VulnType.SAST,
-            "dast": VulnType.DAST,
-            "secret_detection": VulnType.SECRET,
-            "container_scanning": VulnType.CONTAINER,
+            "dependency_scanning": VulnType.DEPENDENCY,  # Package/library vulnerabilities
+            "sast": VulnType.SAST,  # Source code analysis
+            "dast": VulnType.DAST,  # Runtime/dynamic testing
+            "secret_detection": VulnType.SECRET,  # Exposed credentials
+            "container_scanning": VulnType.CONTAINER,  # Docker image vulnerabilities
         }
+        # Default to SAST for unknown types (code-level fix approach)
         return mapping.get(report_type.lower(), VulnType.SAST)
 
     def get_cve(self, vuln: Vulnerability) -> str | None:

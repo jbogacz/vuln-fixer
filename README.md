@@ -225,6 +225,9 @@ options:
 - Confidence scores help identify uncertain fixes
 - Dry-run mode for safe previewing
 - Prompts instruct AI to make minimal changes only
+- **Dirty repo check** - Aborts if uncommitted changes exist (prevents accidental commits)
+- **Scope limitation** - AI is strictly limited to fixing only the requested CVE/package
+- **Full analysis in MR** - MR description includes Claude's complete analysis (key findings, changes made, style compliance, confidence reasoning)
 
 ## Project Structure
 

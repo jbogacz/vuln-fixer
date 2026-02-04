@@ -254,6 +254,14 @@ options:
 - [x] Smart transitive dependency detection
 - [x] False positive detection (identifies already-patched dependencies)
 
+### Phase 4.5: Safety & Quality ✅
+- [x] Dirty repo check (abort if uncommitted changes exist)
+- [x] Scope limitation in prompts (only fix requested CVE/package)
+- [x] Full analysis in MR descriptions (explanation, key findings, changes, confidence)
+- [x] Robust confidence parsing (handles markdown-formatted output)
+- [x] Robust git status parsing (handles variable whitespace)
+- [x] VulnType documentation (explains GitLab report_type mapping)
+
 ### Phase 5: Automation
 - [ ] CI/CD integration
 - [ ] Fix validation (run tests)
@@ -302,3 +310,35 @@ The agent intelligently handles:
 - **Transitive dependencies**: Finds the actual source, not just flagged files
 - **Centralized fixes**: Uses root build.gradle.kts when appropriate
 - **Consistent changes**: Applies same fix pattern across all affected files
+
+---
+
+## Safety Features
+
+### Dirty Repo Check
+Before starting any fix (except dry-run), the tool checks for uncommitted changes:
+```
+Error: Repository has uncommitted changes:
+  - file1.txt
+  - file2.kt
+
+Please commit or stash your changes before running vuln-fixer.
+```
+This prevents accidental commits of unrelated changes.
+
+### Scope Limitation
+Every fix prompt includes strict scope constraints:
+```
+## CRITICAL: Scope Limitation
+You are ONLY fixing CVE-2024-12798 which affects: ch.qos.logback/logback-core
+- DO NOT fix any other vulnerabilities or CVEs
+- DO NOT update any other packages
+- If you see other vulnerabilities, IGNORE them
+```
+
+### Full Analysis in MR
+MR descriptions now include Claude's complete analysis:
+- **Key findings**: What was discovered during analysis
+- **Changes made**: Specific modifications with file paths
+- **Style compliance**: How the fix matches existing code patterns
+- **Confidence reasoning**: Why the confidence score was assigned

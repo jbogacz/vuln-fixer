@@ -119,11 +119,23 @@ class Vulnerability:
     title: str
     description: str
     severity: Severity        # critical, high, medium, low
-    vuln_type: VulnType       # dependency, sast, dast, secret
+    vuln_type: VulnType       # dependency, sast, dast, secret, container
     location: Location        # file, line numbers, package
     identifiers: list[str]    # CVE-xxxx, CWE-xxx
     solution: str | None
 ```
+
+**VulnType Mapping (from GitLab's `report_type` field):**
+
+| GitLab report_type | VulnType | Description | Fix Strategy |
+|-------------------|----------|-------------|--------------|
+| `dependency_scanning` | DEPENDENCY | Package/library vulnerabilities | Upgrade version in manifest |
+| `sast` | SAST | Static code analysis (SQLi, XSS, etc.) | Modify vulnerable code pattern |
+| `dast` | DAST | Dynamic/runtime testing | Modify code/config |
+| `secret_detection` | SECRET | Exposed credentials | Remove + use env vars/vaults |
+| `container_scanning` | CONTAINER | Docker image vulnerabilities | Update base image/packages |
+
+GitLab calls it "report_type" because vulnerabilities come from different CI scanner jobs, each producing a report artifact (e.g., `gl-dependency-scanning-report.json`).
 
 ### 3. Fixer Agent (`fixer_agent.py`)
 
@@ -173,21 +185,32 @@ vuln-fixer -r /path/to/repo fix-all   # Batch fix
                                   │
                                   ▼
                     ┌─────────────────────────┐
-                    │  1. Auto-detect project │
+                    │  1. Check repo is clean │
+                    │     (no uncommitted     │
+                    │      changes)           │
+                    └───────────┬─────────────┘
+                                │ ABORT if dirty
+                                ▼
+                    ┌─────────────────────────┐
+                    │  2. Auto-detect project │
                     │     from git remote     │
                     └───────────┬─────────────┘
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  2. Fetch vuln details  │
+                    │  3. Fetch vuln details  │
                     │     via glab api        │
                     └───────────┬─────────────┘
                                 │
                                 ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│  3. CLAUDE CLI SUBPROCESS                                         │
+│  4. CLAUDE CLI SUBPROCESS                                         │
 │                                                                   │
 │     subprocess.run(["claude", "-p", prompt, ...], cwd=repo_path)  │
+│                                                                   │
+│     Prompt includes SCOPE LIMITATION:                             │
+│     - Only fix the specified CVE/package                          │
+│     - Ignore other vulnerabilities                                │
 │                                                                   │
 │     Claude CLI autonomously:                                      │
 │     ├─▶ Reads the affected file                                   │
@@ -199,31 +222,34 @@ vuln-fixer -r /path/to/repo fix-all   # Batch fix
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  4. Check confidence    │
+                    │  5. Check confidence    │
                     │     threshold           │
                     └───────────┬─────────────┘
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  5. Create branch       │
+                    │  6. Create branch       │
                     │     git checkout -b     │
                     └───────────┬─────────────┘
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  6. Commit & push       │
+                    │  7. Commit & push       │
                     │     git add/commit/push │
                     └───────────┬─────────────┘
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  7. Create MR           │
-                    │     glab mr create      │
+                    │  8. Create MR with      │
+                    │     full analysis       │
+                    │     (explanation, key   │
+                    │     findings, changes,  │
+                    │     confidence)         │
                     └───────────┬─────────────┘
                                 │
                                 ▼
                     ┌─────────────────────────┐
-                    │  8. Return MR URL       │
+                    │  9. Return MR URL       │
                     │     for human review    │
                     └─────────────────────────┘
 ```
@@ -280,6 +306,7 @@ glab auth login
 |----------|----------|
 | Not a git repo | Error with clear message |
 | No git remote | Error with instructions |
+| **Uncommitted changes** | **Abort with list of dirty files** |
 | glab not installed | Error with install instructions |
 | glab not authenticated | Error: "Run glab auth login" |
 | Claude CLI timeout | Return error, continue to next vuln |

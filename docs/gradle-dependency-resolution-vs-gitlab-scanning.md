@@ -189,6 +189,20 @@ implementation("com.vulnerable:library:2.0.0")  // safe version
 ./gradlew dependencies --configuration compileClasspath | grep "library"
 ```
 
+## How vuln-fixer Handles This
+
+The fixer agent (`fix_dependency` and `fix_cve_group` prompts) automatically detects Gradle false positives before applying fixes:
+
+1. **Detection**: When targeting a Gradle project, the agent runs `./gradlew dependencyInsight --dependency <package> --configuration compileClasspath` to check the resolved vs. declared version.
+2. **Analysis**: If the resolved version is already safe (>= fixed version), the agent identifies it as a false positive — runtime is protected by Gradle conflict resolution, but GitLab flags the declared transitive version.
+3. **Fix strategy** (in priority order):
+   - **Upgrade the source** — find the dependency that pulls in the vulnerable transitive and upgrade it to a version that no longer declares the vulnerable version (Option B above). This is preferred because it removes the vulnerable declaration from the tree entirely, satisfying GitLab.
+   - **Add a constraint** — enforce a minimum version via `constraints {}` block (Option A above). Simpler but GitLab may still flag it.
+   - **Exclude and re-declare** — last resort (Option C above).
+4. **Reporting**: The agent's EXPLANATION always includes whether the runtime was already safe, which dependency is the root cause, and why it chose a particular fix strategy.
+
+This prevents the agent from naively bumping a version that isn't directly declared, and ensures it traces the vulnerability back to its transitive source.
+
 ## Key Takeaways
 
 1. **Gradle conflict resolution protects runtime** - Only the highest version is used

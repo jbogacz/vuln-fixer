@@ -375,19 +375,55 @@ You are ONLY fixing the vulnerability in package: {package_name}
 
 ## Instructions
 
-### Step 1: Analyze Dependency File Style (CRITICAL)
+### Step 1: Check for Gradle False Positive (IMPORTANT - Gradle projects only)
+If this is a Gradle project (build.gradle or build.gradle.kts exists), BEFORE making any changes:
+
+1. Run: `./gradlew dependencyInsight --dependency {package_name} --configuration compileClasspath 2>/dev/null || true`
+   (try multiple modules if needed, e.g. `./gradlew :module-name:dependencyInsight ...`)
+2. Look at the output to determine:
+   - **Resolved version**: What version does Gradle actually resolve to at runtime?
+   - **Requested version**: What version is declared in the dependency tree?
+   - **Dependency chain**: Which library pulls in the vulnerable transitive version?
+
+3. If the resolved version is ALREADY >= the fixed version (meaning Gradle conflict resolution
+   already picks a safe version), this is a **false positive** at runtime. However, GitLab's
+   scanner flags the *declared* transitive dependency version, not the resolved one.
+   To silence the GitLab scanner, you MUST still fix it.
+
+4. **Fix strategy for false positives (transitive dependency issues):**
+   - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive.
+     For example, if `library-A:1.0` pulls in `vulnerable-lib:1.2.3`, upgrade `library-A`
+     to a version that declares `vulnerable-lib >= fixed-version`.
+   - **Alternative**: Add a dependency constraint in the build.gradle.kts to enforce minimum version:
+     ```kotlin
+     dependencies {{
+         constraints {{
+             implementation("{package_name}:<fixed-version>") {{
+                 because("<CVE-ID>: <brief description>")
+             }}
+         }}
+     }}
+     ```
+   - **Last resort**: Exclude the transitive and re-declare at safe version.
+
+5. In your EXPLANATION, always report:
+   - Whether the resolved runtime version was already safe
+   - Which dependency is the source of the vulnerable transitive
+   - Which fix strategy you chose and why
+
+### Step 2: Analyze Dependency File Style (CRITICAL)
 Before making changes, read the dependency file to identify:
 - Version pinning style (exact: "1.2.3", range: "^1.2.3", ">=1.2.3")
 - How dependencies are declared (string literals vs version catalogs vs variables)
 - Formatting and organization of dependencies
 
-### Step 2: Fix ONLY the {package_name} Vulnerability
+### Step 3: Fix ONLY the {package_name} Vulnerability
 1. Find the dependency file (requirements.txt, package.json, pyproject.toml, build.gradle.kts, pom.xml, etc.)
 2. Locate the {package_name} package
 3. {"Explain the required version change" if dry_run else "Update to a safe version"}
 4. ONLY change the {package_name} version - nothing else
 
-### Step 3: Match Existing Style (MANDATORY)
+### Step 4: Match Existing Style (MANDATORY)
 Your fix MUST match the existing dependency file style EXACTLY:
 - If other dependencies use string literals like "group:artifact:version", you MUST use the same format
 - If other dependencies use version catalogs (libs.xxx), then use version catalogs
@@ -395,9 +431,39 @@ Your fix MUST match the existing dependency file style EXACTLY:
 - DO NOT add entries to version catalog files (libs.versions.toml) unless the project already uses them for similar dependencies
 - The goal is MINIMAL change - only add/change the version number, nothing else
 
-Provide:
-- EXPLANATION: What version change {"is needed" if dry_run else "was made"}
-- CONFIDENCE: Your confidence (0.0-1.0) that this upgrade is safe
+## Response Format
+
+Provide your response in these EXACT sections:
+
+EXPLANATION:
+
+## Summary
+- One-line description of what was done (e.g., "Fix CVE-XXXX by upgrading package X from A to B in `module/build.gradle.kts`")
+- If false positive: note it was a false positive in GitLab scanner
+
+## Context
+Explain the root cause. If this was a Gradle false positive, explain:
+- Which dependency declares the vulnerable transitive version
+- What version Gradle actually resolves to at runtime
+- Why GitLab flags it anyway (scans declarations, not resolved classpath)
+If not a false positive, explain the vulnerability and why the fix is needed.
+
+## What was changed
+- List each file modified and what was changed (e.g., "Upgraded `library-X` from `1.0` to `2.0` in `module/build.gradle.kts`")
+
+## Why we were safe before this change
+(Include ONLY if this was a Gradle false positive)
+Show a table like:
+| Stage | Version | In runtime classpath? |
+|-------|---------|----------------------|
+| library-X requests | vulnerable-version | **No** |
+| BOM/other manages | safe-version | **Yes** |
+Explain briefly that Gradle conflict resolution was already picking the safe version.
+
+## Why this change is needed
+Explain why we still need to make the change (e.g., to silence GitLab scanner, or because the vulnerable version IS in the classpath).
+
+CONFIDENCE: Your confidence (0.0-1.0) that this upgrade is safe
 """
 
         result = self._run_claude(prompt, repo_path)
@@ -474,19 +540,60 @@ You are ONLY fixing {cve} which affects the package(s): {packages_str}
 
 ## Instructions
 
-### Step 1: Analyze Dependency File Style (CRITICAL)
+### Step 1: Check for Gradle False Positive (IMPORTANT - Gradle projects only)
+If this is a Gradle project (build.gradle or build.gradle.kts exists), BEFORE making any changes:
+
+1. Run dependency insight to check what version Gradle actually resolves at runtime:
+   `./gradlew dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration compileClasspath 2>/dev/null || true`
+   (try multiple modules from the affected files list above)
+2. Analyze the output to determine:
+   - **Resolved version**: What does Gradle actually use at runtime?
+   - **Requested version**: What's declared in the dependency tree?
+   - **Dependency chain**: Which library pulls in the vulnerable version as a transitive?
+
+3. If the resolved version is ALREADY safe (>= fixed version), this is a **false positive** at runtime.
+   GitLab flags the *declared* transitive dependency, not the resolved one.
+   You MUST still fix it to silence the GitLab scanner.
+
+4. **Fix strategy for transitive dependency false positives:**
+   - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive.
+     Example: if `library-A:1.0` → `vulnerable-lib:1.2.3` (transitive), upgrade `library-A`
+     to a newer version that no longer declares the vulnerable transitive version.
+     Find the source by looking at the dependencyInsight output chain.
+   - **Alternative**: Add a dependency constraint to enforce minimum version:
+     ```kotlin
+     dependencies {{
+         constraints {{
+             implementation("{packages_str.split(',')[0].strip()}:<fixed-version>") {{
+                 because("{cve}: <brief description>")
+             }}
+         }}
+     }}
+     ```
+   - **Last resort**: Exclude the transitive and re-declare at safe version.
+
+5. **IMPORTANT**: When the same transitive source affects multiple modules, the fix may be
+   in a single shared build file (e.g., root `build.gradle.kts` or a common module) rather
+   than in each affected file individually.
+
+6. In your EXPLANATION, always report:
+   - Whether the resolved runtime version was already safe
+   - Which dependency is the source of the vulnerable transitive
+   - Which fix strategy you chose and why
+
+### Step 2: Analyze Dependency File Style (CRITICAL)
 Before making changes, read the dependency files to identify:
 - Version pinning style (exact: "1.2.3", range: "^1.2.3", ">=1.2.3")
 - How dependencies are declared (string literals vs version catalogs vs variables)
 - Formatting and organization of dependencies
 
-### Step 2: Fix ONLY the Affected Package in ALL Listed Files
+### Step 3: Fix ONLY the Affected Package in ALL Listed Files
 1. Read each affected file listed above
 2. {"Explain the required changes" if dry_run else "Update each file to use the safe version"}
 3. Apply the SAME fix pattern to all files
 4. ONLY change the {packages_str} package version - nothing else
 
-### Step 3: Match Existing Style (MANDATORY)
+### Step 4: Match Existing Style (MANDATORY)
 Your fix MUST match the existing dependency file style EXACTLY:
 - If other dependencies use string literals like "group:artifact:version", you MUST use the same format
 - If other dependencies use version catalogs (libs.xxx), then use version catalogs
@@ -494,9 +601,40 @@ Your fix MUST match the existing dependency file style EXACTLY:
 - DO NOT add entries to version catalog files (libs.versions.toml) unless the project already uses them for similar dependencies
 - The goal is MINIMAL change - only add/change the version number, nothing else
 
-Provide:
-- EXPLANATION: What changes {"are needed" if dry_run else "were made"} across all files
-- CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
+## Response Format
+
+Provide your response in these EXACT sections:
+
+EXPLANATION:
+
+## Summary
+- One-line description of what was done (e.g., "Fix {cve} ({packages_str}) by upgrading source dependency X in `module/build.gradle.kts`")
+- If false positive: note it was a false positive in GitLab scanner
+- Number of affected files/modules
+
+## Context
+Explain the root cause. If this was a Gradle false positive, explain:
+- Which dependency declares the vulnerable transitive version
+- What version Gradle actually resolves to at runtime
+- Why GitLab flags it anyway (scans declarations, not resolved classpath)
+If not a false positive, explain the vulnerability and why the fix is needed.
+
+## What was changed
+- List each file modified and what was changed (e.g., "Upgraded `library-X` from `1.0` to `2.0` in `module/build.gradle.kts`")
+
+## Why we were safe before this change
+(Include ONLY if this was a Gradle false positive)
+Show a table like:
+| Stage | Version | In runtime classpath? |
+|-------|---------|----------------------|
+| library-X requests | vulnerable-version | **No** |
+| BOM/other manages | safe-version | **Yes** |
+Explain briefly that Gradle conflict resolution was already picking the safe version.
+
+## Why this change is needed
+Explain why we still need to make the change (e.g., to silence GitLab scanner, or because the vulnerable version IS in the classpath).
+
+CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
 """
 
         result = self._run_claude(prompt, repo_path)

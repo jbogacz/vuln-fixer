@@ -418,11 +418,14 @@ class GitLabClient:
             MR info dict or None if failed
         """
         try:
+            # Always create as Draft so it requires explicit un-drafting before merge
+            draft_title = title if title.startswith("Draft: ") else f"Draft: {title}"
+
             args = [
                 "mr", "create",
                 "--source-branch", source_branch,
                 "--target-branch", target_branch,
-                "--title", title,
+                "--title", draft_title,
                 "--description", description,
                 "--remove-source-branch",
                 "--yes"  # Skip confirmation

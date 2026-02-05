@@ -99,6 +99,7 @@ class FixerAgent:
             files_modified = []
             turn_count = 0
             last_tool = None
+            last_event_type = None
 
             # Stream and parse JSON lines
             try:
@@ -112,10 +113,14 @@ class FixerAgent:
                         event_type = event.get("type", "")
 
                         # Track assistant turns (iterations)
+                        # Only count as a new turn when the previous event was NOT
+                        # an assistant event - stream-json emits multiple "assistant"
+                        # events per turn (one per content block), so we deduplicate.
                         if event_type == "assistant":
-                            turn_count += 1
-                            if verbose:
-                                print(f"  [Turn {turn_count}/{self.max_turns}] Agent thinking...", flush=True)
+                            if last_event_type != "assistant":
+                                turn_count += 1
+                                if verbose:
+                                    print(f"  [Turn {turn_count}/{self.max_turns}] Agent thinking...", flush=True)
 
                         # Track tool usage
                         elif event_type == "tool_use":
@@ -138,6 +143,8 @@ class FixerAgent:
                         # Capture final result
                         elif event_type == "result":
                             result_data = event
+
+                        last_event_type = event_type
 
                     except json.JSONDecodeError:
                         continue
@@ -229,7 +236,8 @@ class FixerAgent:
         self,
         vuln: Vulnerability,
         repo_path: Path,
-        dry_run: bool = False
+        dry_run: bool = False,
+        retry_context: str | None = None,
     ) -> Fix | None:
         """
         Analyze vulnerability and generate a fix using Claude CLI.
@@ -303,10 +311,22 @@ Your fix MUST match the existing code style EXACTLY:
 - DO NOT refactor or "improve" the code beyond fixing the security issue
 - The goal is MINIMAL change that blends in with existing code
 
-After {"analyzing" if dry_run else "fixing"}, provide:
-- EXPLANATION: What the vulnerability is and how {"to fix" if dry_run else "it was fixed"}
-- CONFIDENCE: Your confidence level (0.0-1.0) that this fix is correct
+After {"analyzing" if dry_run else "fixing"}, write your response as markdown that will be used directly
+as the merge request description. Structure it as:
+
+## Summary
+- Brief description of the vulnerability and the fix applied
+
+## What was changed
+- List each file and what was modified
+
+Then on the VERY LAST LINE of your response, output your confidence as an HTML comment:
+<!--CONFIDENCE:0.95-->
+(replace 0.95 with your actual confidence from 0.0 to 1.0)
 """
+
+        if retry_context:
+            prompt += retry_context
 
         # Run Claude CLI
         result = self._run_claude(prompt, repo_path)
@@ -338,7 +358,8 @@ After {"analyzing" if dry_run else "fixing"}, provide:
         self,
         vuln: Vulnerability,
         repo_path: Path,
-        dry_run: bool = False
+        dry_run: bool = False,
+        retry_context: str | None = None,
     ) -> Fix | None:
         """
         Generate fix for dependency vulnerability using Claude CLI.
@@ -375,41 +396,74 @@ You are ONLY fixing the vulnerability in package: {package_name}
 
 ## Instructions
 
-### Step 1: Check for Gradle False Positive (IMPORTANT - Gradle projects only)
+### Step 1: Gradle Dependency Analysis (CRITICAL - Gradle projects only)
 If this is a Gradle project (build.gradle or build.gradle.kts exists), BEFORE making any changes:
 
-1. Run: `./gradlew dependencyInsight --dependency {package_name} --configuration compileClasspath 2>/dev/null || true`
-   (try multiple modules if needed, e.g. `./gradlew :module-name:dependencyInsight ...`)
-2. Look at the output to determine:
-   - **Resolved version**: What version does Gradle actually resolve to at runtime?
-   - **Requested version**: What version is declared in the dependency tree?
-   - **Dependency chain**: Which library pulls in the vulnerable transitive version?
+#### 1a. Find which configuration contains the vulnerable dependency
+The dependency may NOT be in `compileClasspath`/`runtimeClasspath`. It could be in a build-tool
+configuration like `ktlint`, `detekt`, `checkstyle`, `spotbugs`, `pmd`, etc.
 
-3. If the resolved version is ALREADY >= the fixed version (meaning Gradle conflict resolution
-   already picks a safe version), this is a **false positive** at runtime. However, GitLab's
-   scanner flags the *declared* transitive dependency version, not the resolved one.
-   To silence the GitLab scanner, you MUST still fix it.
+Run dependency insight across MULTIPLE configurations to find where it actually lives:
+```
+./gradlew :module-name:dependencyInsight --dependency {package_name} --configuration compileClasspath 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {package_name} --configuration runtimeClasspath 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {package_name} --configuration ktlint 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {package_name} --configuration detekt 2>/dev/null || true
+```
+Also check: `./gradlew :module-name:dependencies 2>/dev/null | grep -i "{package_name.split(':')[-1] if ':' in package_name else package_name}"` to see ALL configurations.
 
-4. **Fix strategy for false positives (transitive dependency issues):**
-   - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive.
-     For example, if `library-A:1.0` pulls in `vulnerable-lib:1.2.3`, upgrade `library-A`
-     to a version that declares `vulnerable-lib >= fixed-version`.
-   - **Alternative**: Add a dependency constraint in the build.gradle.kts to enforce minimum version:
-     ```kotlin
-     dependencies {{
-         constraints {{
-             implementation("{package_name}:<fixed-version>") {{
-                 because("<CVE-ID>: <brief description>")
-             }}
-         }}
-     }}
-     ```
-   - **Last resort**: Exclude the transitive and re-declare at safe version.
+#### 1b. Determine the context
+From the dependency insight output, determine:
+- **Which configuration(s)** contain the vulnerable dependency (e.g., `compileClasspath`, `ktlint`, `detekt`)
+- **Is it a runtime dependency or build-tool-only?** If it's in `ktlint`, `detekt`, `checkstyle`,
+  `spotbugs`, or similar — it is a BUILD-TOOL dependency with NO production runtime exposure.
+- **Resolved version**: What version does Gradle actually resolve to?
+- **Requested version**: What version is declared in the dependency tree?
+- **Version branch**: What major.minor branch is the vulnerable version on? (e.g., 1.3.x vs 1.5.x)
+  The fix version MUST be on the SAME branch. For example, logback-core 1.3.14 needs >= 1.3.15, NOT 1.5.21.
+- **Dependency chain**: Which library pulls in the vulnerable transitive version?
 
-5. In your EXPLANATION, always report:
-   - Whether the resolved runtime version was already safe
-   - Which dependency is the source of the vulnerable transitive
-   - Which fix strategy you chose and why
+#### 1c. Choose the correct fix strategy
+**CRITICAL: Apply fixes to the CORRECT configuration. Do NOT add `implementation` constraints
+for dependencies that only exist in build-tool configurations like `ktlint` or `detekt`.**
+
+- **If build-tool-only dependency** (ktlint, detekt, etc.):
+  - **Preferred**: Upgrade the build tool plugin/dependency to a version that uses the safe library version
+  - **Alternative**: Add a resolution strategy to that SPECIFIC configuration:
+    ```kotlin
+    configurations.named("ktlint") {{
+        resolutionStrategy {{
+            force("{package_name}:<fixed-version-on-same-branch>")
+        }}
+    }}
+    ```
+  - Note in your analysis that this has NO production runtime exposure
+
+- **If runtime dependency (compileClasspath/runtimeClasspath)**:
+  - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive
+  - **Alternative**: Add a dependency constraint (to `implementation`, NOT to build-tool configs):
+    ```kotlin
+    dependencies {{
+        constraints {{
+            implementation("{package_name}:<fixed-version>") {{
+                because("<CVE-ID>: <brief description>")
+            }}
+        }}
+    }}
+    ```
+  - **Last resort**: Exclude the transitive and re-declare at safe version
+
+- **If the resolved runtime version is already safe** (Gradle conflict resolution picks a safe version):
+  This is a **false positive** at runtime. GitLab flags the *declared* transitive version, not
+  the resolved one. You MUST still fix it to silence the GitLab scanner.
+
+#### 1d. In your response, always report:
+- Which Gradle configuration(s) contain the vulnerable dependency
+- Whether it is a runtime or build-tool-only dependency
+- Whether the resolved runtime version was already safe
+- Which dependency is the source of the vulnerable transitive
+- The version branch (e.g., "1.3.x line needs >= 1.3.15, not 1.5.x")
+- Which fix strategy you chose and why
 
 ### Step 2: Analyze Dependency File Style (CRITICAL)
 Before making changes, read the dependency file to identify:
@@ -433,38 +487,42 @@ Your fix MUST match the existing dependency file style EXACTLY:
 
 ## Response Format
 
-Provide your response in these EXACT sections:
-
-EXPLANATION:
+Your response will be used DIRECTLY as the merge request description (markdown).
+Do NOT wrap it in any prefix like "EXPLANATION:" — just write the content.
+Structure it with these sections:
 
 ## Summary
-- One-line description of what was done (e.g., "Fix CVE-XXXX by upgrading package X from A to B in `module/build.gradle.kts`")
-- If false positive: note it was a false positive in GitLab scanner
+- One-line description of what was done
+- Note if it was a false positive (build-tool only, or runtime already safe)
 
 ## Context
-Explain the root cause. If this was a Gradle false positive, explain:
+Explain the root cause:
+- Which Gradle **configuration** contains the vulnerable dependency (e.g., `compileClasspath`, `ktlint`, `detekt`)
+- Whether it's a **runtime** or **build-tool-only** dependency
 - Which dependency declares the vulnerable transitive version
-- What version Gradle actually resolves to at runtime
-- Why GitLab flags it anyway (scans declarations, not resolved classpath)
-If not a false positive, explain the vulnerability and why the fix is needed.
+- What version branch the vulnerability is on (e.g., "1.3.x line, fix requires >= 1.3.15")
+- What version Gradle actually resolves to (if applicable)
+- Why GitLab flags it (scans declarations, not resolved classpath)
 
 ## What was changed
-- List each file modified and what was changed (e.g., "Upgraded `library-X` from `1.0` to `2.0` in `module/build.gradle.kts`")
+- List each file modified and what was changed
+- Explain why the fix targets the correct configuration
 
 ## Why we were safe before this change
-(Include ONLY if this was a Gradle false positive)
-Show a table like:
-| Stage | Version | In runtime classpath? |
-|-------|---------|----------------------|
-| library-X requests | vulnerable-version | **No** |
-| BOM/other manages | safe-version | **Yes** |
-Explain briefly that Gradle conflict resolution was already picking the safe version.
+(Include if the runtime was already safe or dependency is build-tool-only)
+If build-tool-only: explain that the dependency has no production runtime exposure.
+If runtime false positive: show a version resolution table.
 
 ## Why this change is needed
-Explain why we still need to make the change (e.g., to silence GitLab scanner, or because the vulnerable version IS in the classpath).
+Explain why we still need to make the change to silence the GitLab scanner.
 
-CONFIDENCE: Your confidence (0.0-1.0) that this upgrade is safe
+On the VERY LAST LINE, output your confidence as an HTML comment:
+<!--CONFIDENCE:0.95-->
+(replace 0.95 with your actual confidence from 0.0 to 1.0)
 """
+
+        if retry_context:
+            prompt += retry_context
 
         result = self._run_claude(prompt, repo_path)
 
@@ -488,7 +546,8 @@ CONFIDENCE: Your confidence (0.0-1.0) that this upgrade is safe
         cve: str,
         vulns: list,
         repo_path: Path,
-        dry_run: bool = False
+        dry_run: bool = False,
+        retry_context: str | None = None,
     ) -> Fix | None:
         """
         Fix all vulnerabilities in a CVE group at once.
@@ -540,46 +599,79 @@ You are ONLY fixing {cve} which affects the package(s): {packages_str}
 
 ## Instructions
 
-### Step 1: Check for Gradle False Positive (IMPORTANT - Gradle projects only)
+### Step 1: Gradle Dependency Analysis (CRITICAL - Gradle projects only)
 If this is a Gradle project (build.gradle or build.gradle.kts exists), BEFORE making any changes:
 
-1. Run dependency insight to check what version Gradle actually resolves at runtime:
-   `./gradlew dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration compileClasspath 2>/dev/null || true`
-   (try multiple modules from the affected files list above)
-2. Analyze the output to determine:
-   - **Resolved version**: What does Gradle actually use at runtime?
-   - **Requested version**: What's declared in the dependency tree?
-   - **Dependency chain**: Which library pulls in the vulnerable version as a transitive?
+#### 1a. Find which configuration contains the vulnerable dependency
+The dependency may NOT be in `compileClasspath`/`runtimeClasspath`. It could be in a build-tool
+configuration like `ktlint`, `detekt`, `checkstyle`, `spotbugs`, `pmd`, etc.
 
-3. If the resolved version is ALREADY safe (>= fixed version), this is a **false positive** at runtime.
-   GitLab flags the *declared* transitive dependency, not the resolved one.
-   You MUST still fix it to silence the GitLab scanner.
+Run dependency insight across MULTIPLE configurations on affected modules:
+```
+./gradlew :module-name:dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration compileClasspath 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration runtimeClasspath 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration ktlint 2>/dev/null || true
+./gradlew :module-name:dependencyInsight --dependency {packages_str.split(',')[0].strip()} --configuration detekt 2>/dev/null || true
+```
+Also check: `./gradlew :module-name:dependencies 2>/dev/null | grep -i "{packages_str.split(',')[0].strip().split(':')[-1]}"` to see ALL configurations.
 
-4. **Fix strategy for transitive dependency false positives:**
-   - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive.
-     Example: if `library-A:1.0` → `vulnerable-lib:1.2.3` (transitive), upgrade `library-A`
-     to a newer version that no longer declares the vulnerable transitive version.
-     Find the source by looking at the dependencyInsight output chain.
-   - **Alternative**: Add a dependency constraint to enforce minimum version:
-     ```kotlin
-     dependencies {{
-         constraints {{
-             implementation("{packages_str.split(',')[0].strip()}:<fixed-version>") {{
-                 because("{cve}: <brief description>")
-             }}
-         }}
-     }}
-     ```
-   - **Last resort**: Exclude the transitive and re-declare at safe version.
+#### 1b. Determine the context
+From the dependency insight output, determine:
+- **Which configuration(s)** contain the vulnerable dependency (e.g., `compileClasspath`, `ktlint`, `detekt`)
+- **Is it a runtime dependency or build-tool-only?** If it's in `ktlint`, `detekt`, `checkstyle`,
+  `spotbugs`, or similar — it is a BUILD-TOOL dependency with NO production runtime exposure.
+- **Resolved version**: What version does Gradle actually resolve to?
+- **Requested version**: What version is declared in the dependency tree?
+- **Version branch**: What major.minor branch is the vulnerable version on? (e.g., 1.3.x vs 1.5.x)
+  The fix version MUST be on the SAME branch. For example, logback-core 1.3.14 needs >= 1.3.15, NOT 1.5.21.
+- **Dependency chain**: Which library pulls in the vulnerable transitive version?
 
-5. **IMPORTANT**: When the same transitive source affects multiple modules, the fix may be
-   in a single shared build file (e.g., root `build.gradle.kts` or a common module) rather
-   than in each affected file individually.
+#### 1c. Choose the correct fix strategy
+**CRITICAL: Apply fixes to the CORRECT configuration. Do NOT add `implementation` constraints
+for dependencies that only exist in build-tool configurations like `ktlint` or `detekt`.**
 
-6. In your EXPLANATION, always report:
-   - Whether the resolved runtime version was already safe
-   - Which dependency is the source of the vulnerable transitive
-   - Which fix strategy you chose and why
+- **If build-tool-only dependency** (ktlint, detekt, etc.):
+  - **Preferred**: Upgrade the build tool plugin/dependency to a version that uses the safe library version
+  - **Alternative**: Add a resolution strategy to that SPECIFIC configuration:
+    ```kotlin
+    configurations.named("ktlint") {{
+        resolutionStrategy {{
+            force("{packages_str.split(',')[0].strip()}:<fixed-version-on-same-branch>")
+        }}
+    }}
+    ```
+  - Note in your analysis that this has NO production runtime exposure
+
+- **If runtime dependency (compileClasspath/runtimeClasspath)**:
+  - **Preferred**: Upgrade the SOURCE dependency that pulls in the vulnerable transitive
+  - **Alternative**: Add a dependency constraint (to `implementation`, NOT to build-tool configs):
+    ```kotlin
+    dependencies {{
+        constraints {{
+            implementation("{packages_str.split(',')[0].strip()}:<fixed-version>") {{
+                because("{cve}: <brief description>")
+            }}
+        }}
+    }}
+    ```
+  - **Last resort**: Exclude the transitive and re-declare at safe version
+
+- **If the resolved runtime version is already safe** (Gradle conflict resolution picks a safe version):
+  This is a **false positive** at runtime. GitLab flags the *declared* transitive version, not
+  the resolved one. You MUST still fix it to silence the GitLab scanner.
+
+#### 1d. Important considerations
+- When the same transitive source affects multiple modules, the fix may be in a single shared
+  build file (e.g., root `build.gradle.kts` or a common module) rather than each file individually.
+- When adding constraints or resolution strategies, make sure they apply to ALL affected modules.
+
+#### 1e. In your response, always report:
+- Which Gradle configuration(s) contain the vulnerable dependency
+- Whether it is a runtime or build-tool-only dependency
+- Whether the resolved runtime version was already safe
+- Which dependency is the source of the vulnerable transitive
+- The version branch (e.g., "1.3.x line needs >= 1.3.15, not 1.5.x")
+- Which fix strategy you chose and why
 
 ### Step 2: Analyze Dependency File Style (CRITICAL)
 Before making changes, read the dependency files to identify:
@@ -603,39 +695,43 @@ Your fix MUST match the existing dependency file style EXACTLY:
 
 ## Response Format
 
-Provide your response in these EXACT sections:
-
-EXPLANATION:
+Your response will be used DIRECTLY as the merge request description (markdown).
+Do NOT wrap it in any prefix like "EXPLANATION:" — just write the content.
+Structure it with these sections:
 
 ## Summary
-- One-line description of what was done (e.g., "Fix {cve} ({packages_str}) by upgrading source dependency X in `module/build.gradle.kts`")
-- If false positive: note it was a false positive in GitLab scanner
+- One-line description of what was done
+- Note if it was a false positive (build-tool only, or runtime already safe)
 - Number of affected files/modules
 
 ## Context
-Explain the root cause. If this was a Gradle false positive, explain:
+Explain the root cause:
+- Which Gradle **configuration** contains the vulnerable dependency (e.g., `compileClasspath`, `ktlint`, `detekt`)
+- Whether it's a **runtime** or **build-tool-only** dependency
 - Which dependency declares the vulnerable transitive version
-- What version Gradle actually resolves to at runtime
-- Why GitLab flags it anyway (scans declarations, not resolved classpath)
-If not a false positive, explain the vulnerability and why the fix is needed.
+- What version branch the vulnerability is on (e.g., "1.3.x line, fix requires >= 1.3.15")
+- What version Gradle actually resolves to (if applicable)
+- Why GitLab flags it (scans declarations, not resolved classpath)
 
 ## What was changed
-- List each file modified and what was changed (e.g., "Upgraded `library-X` from `1.0` to `2.0` in `module/build.gradle.kts`")
+- List each file modified and what was changed
+- Explain why the fix targets the correct configuration
 
 ## Why we were safe before this change
-(Include ONLY if this was a Gradle false positive)
-Show a table like:
-| Stage | Version | In runtime classpath? |
-|-------|---------|----------------------|
-| library-X requests | vulnerable-version | **No** |
-| BOM/other manages | safe-version | **Yes** |
-Explain briefly that Gradle conflict resolution was already picking the safe version.
+(Include if the runtime was already safe or dependency is build-tool-only)
+If build-tool-only: explain that the dependency has no production runtime exposure.
+If runtime false positive: show a version resolution table.
 
 ## Why this change is needed
-Explain why we still need to make the change (e.g., to silence GitLab scanner, or because the vulnerable version IS in the classpath).
+Explain why we still need to make the change to silence the GitLab scanner.
 
-CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
+On the VERY LAST LINE, output your confidence as an HTML comment:
+<!--CONFIDENCE:0.95-->
+(replace 0.95 with your actual confidence from 0.0 to 1.0)
 """
+
+        if retry_context:
+            prompt += retry_context
 
         result = self._run_claude(prompt, repo_path)
 
@@ -658,33 +754,34 @@ CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
         """
         Parse Claude's output to extract explanation and confidence.
 
+        Confidence is extracted from an HTML comment tag: <!--CONFIDENCE:0.95-->
+        Everything else is the explanation (used directly as MR description body).
+
         Args:
             output: Raw output from Claude CLI
 
         Returns:
             Tuple of (explanation, confidence)
         """
-        explanation = output
         confidence = 0.7  # Default confidence
 
-        # Try to extract EXPLANATION section (handles both "EXPLANATION:" and "## EXPLANATION")
-        explanation_match = re.search(
-            r"(?:#{1,3}\s*)?EXPLANATION[:\s]*\n*(.*?)(?=(?:#{1,3}\s*)?CONFIDENCE|\Z)",
-            output,
-            re.IGNORECASE | re.DOTALL
-        )
-        if explanation_match:
-            explanation = explanation_match.group(1).strip()
-
-        # Look for CONFIDENCE with or without colon (Claude may format as "## CONFIDENCE" or "CONFIDENCE:")
-        conf_match = re.search(r"CONFIDENCE[:\s]*\n*\s*\**(\d+\.?\d*)", output, re.IGNORECASE)
+        # Extract confidence from HTML comment: <!--CONFIDENCE:0.95-->
+        conf_match = re.search(r"<!--CONFIDENCE:([\d.]+)-->", output)
         if conf_match:
             try:
                 confidence = float(conf_match.group(1))
                 if confidence > 1:
-                    confidence = confidence / 100  # Handle percentage
+                    confidence = confidence / 100
             except ValueError:
                 pass
+
+        # Explanation = everything except the confidence tag
+        explanation = re.sub(r"\s*<!--CONFIDENCE:[\d.]+-->\s*", "", output).strip()
+
+        # Strip any preamble before the first markdown header (e.g., "Here is the merge request description:\n\n---")
+        header_match = re.search(r"^## ", explanation, re.MULTILINE)
+        if header_match and header_match.start() > 0:
+            explanation = explanation[header_match.start():]
 
         return explanation, min(max(confidence, 0.0), 1.0)
 
@@ -762,13 +859,52 @@ CONFIDENCE: Your confidence (0.0-1.0) that these fixes are correct
             for f in fix.files_modified
         )
 
-        if is_dependency_fix:
+        is_gradle_fix = any(
+            f.endswith(('.gradle', '.gradle.kts'))
+            for f in fix.files_modified
+        )
+
+        if is_gradle_fix:
+            package_name = vuln.location.dependency if vuln else "unknown"
+            specific_checks = f"""
+### Gradle-Specific Validation (CRITICAL)
+You MUST run these checks — do NOT just review the diff. Execute commands in the repo.
+
+#### 1. Configuration Check
+Run `dependencyInsight` on the affected module(s) to verify the fix targets the **correct Gradle configuration**:
+```
+./gradlew :module:dependencyInsight --dependency {package_name} --configuration compileClasspath 2>/dev/null || true
+./gradlew :module:dependencyInsight --dependency {package_name} --configuration runtimeClasspath 2>/dev/null || true
+./gradlew :module:dependencyInsight --dependency {package_name} --configuration ktlint 2>/dev/null || true
+./gradlew :module:dependencyInsight --dependency {package_name} --configuration detekt 2>/dev/null || true
+```
+- If the vulnerability is in a build-tool config (ktlint, detekt, checkstyle), an `implementation` constraint will NOT fix it.
+- If the vulnerability is in runtimeClasspath, a `ktlint` resolution strategy will NOT fix it.
+- FAIL if the fix targets the wrong configuration.
+
+#### 2. Version Branch Check
+- Determine the **version branch** of the vulnerable dependency (e.g., 1.3.x vs 1.5.x).
+- Verify the fix version is on the **same branch**. For example, logback 1.3.14 must be fixed with 1.3.15+, NOT 1.5.21.
+- FAIL if the fix crosses version branches without justification.
+
+#### 3. Resolution Verification
+After applying the fix, verify with `dependencyInsight` that the vulnerable version is actually resolved away:
+- The resolved version in the flagged configuration must be >= the known fixed version.
+- If the resolved version hasn't changed, the fix is ineffective.
+
+#### 4. General Checks
+1. **Version Validity**: Is the new version a real, published version?
+2. **Syntax**: Is the Gradle Kotlin DSL / Groovy syntax correct?
+3. **Scope**: Does the fix apply to the correct dependency (group:artifact)?
+4. **Style**: Does the fix match existing dependency declaration style in the build file?
+"""
+        elif is_dependency_fix:
             specific_checks = """
 ### Dependency-Specific Checks
 1. **Version Validity**: Is the new version a real, published version?
 2. **Version Safety**: Does this version actually fix the CVE? (check if version >= known fixed version)
 3. **Compatibility**: Could this version conflict with other dependencies (e.g., Spring Boot BOM, parent POMs)?
-4. **Syntax**: Is the build file syntax correct (Gradle Kotlin DSL, Maven XML, etc.)?
+4. **Syntax**: Is the build file syntax correct (Maven XML, package.json, etc.)?
 5. **Scope**: Does the fix apply to the correct dependency (group:artifact)?
 6. **Approach**: Is using constraints/dependencyManagement the right approach, or should the direct dependency be updated?
 """
@@ -893,3 +1029,24 @@ Brief explanation of your assessment
             suggestions=suggestions,
             confidence=min(max(confidence, 0.0), 1.0)
         )
+
+    @staticmethod
+    def build_retry_context(validation: ValidationResult) -> str:
+        """Build a retry context string from a failed validation result."""
+        issues_str = "\n".join(f"- {issue}" for issue in validation.issues) if validation.issues else "- (none listed)"
+        suggestions_str = "\n".join(f"- {s}" for s in validation.suggestions) if validation.suggestions else "- (none)"
+
+        return f"""
+
+## IMPORTANT: Previous Attempt Failed Validation
+
+Your previous fix was rejected by the validator for these reasons:
+
+Issues:
+{issues_str}
+
+Suggestions:
+{suggestions_str}
+
+You MUST address ALL of these issues in your new fix. Do NOT repeat the same mistake.
+"""

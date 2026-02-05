@@ -12,7 +12,7 @@ agent:
   timeout: 300
 
   # Max agent loop iterations
-  max_turns: 50
+  max_turns: 80
 
 options:
   # Automatically create MRs after fixing
@@ -31,3 +31,6 @@ options:
 
   # Minimum confidence score to accept a fix (0.0-1.0)
   min_confidence: 0.7
+
+  # Max retries when validation fails (0 = no retry, just prompt)
+  max_retries: 1

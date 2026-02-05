@@ -268,17 +268,35 @@ class GitLabClient:
         Returns:
             List of vulnerability dictionaries
         """
-        # Use the vulnerability findings API
+        all_vulns = []
+        page = 1
+        per_page = 100
+
+        # Use the vulnerability findings API with pagination
         try:
-            result = self._api("projects/:id/vulnerability_findings", method="GET")
-            if isinstance(result, list):
-                return result
-            return result.get("vulnerabilities", [])
+            while True:
+                endpoint = f"projects/:id/vulnerability_findings?per_page={per_page}&page={page}"
+                result = self._api(endpoint, method="GET")
+
+                if isinstance(result, list):
+                    if not result:  # Empty page = no more results
+                        break
+                    all_vulns.extend(result)
+                    if len(result) < per_page:  # Last page
+                        break
+                    page += 1
+                else:
+                    # Non-list response, try to extract vulnerabilities
+                    vulns = result.get("vulnerabilities", [])
+                    all_vulns.extend(vulns)
+                    break
+
+            return all_vulns
         except Exception as e:
             print(f"Warning: Could not fetch vulnerability_findings: {e}")
             # Fallback to vulnerabilities endpoint
             try:
-                result = self._api("projects/:id/vulnerabilities", method="GET")
+                result = self._api(f"projects/:id/vulnerabilities?per_page={per_page}", method="GET")
                 if isinstance(result, list):
                     return result
                 return []

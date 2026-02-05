@@ -9,7 +9,7 @@ import yaml
 
 from .gitlab_client import create_client_from_repo
 from .vuln_parser import VulnParser, Severity, VulnType
-from .fixer_agent import FixerAgent
+from .fixer_agent import FixerAgent, ValidationResult
 
 
 def check_repo_is_clean(repo_path: Path) -> tuple[bool, list[str]]:
@@ -164,6 +164,24 @@ def slugify(text: str, max_length: int = 50) -> str:
     return slug
 
 
+def display_validation_result(validation: ValidationResult) -> None:
+    """Display validation result to user."""
+    status = "PASSED" if validation.valid else "FAILED"
+    color = "green" if validation.valid else "red"
+
+    click.echo(f"\n--- Validation: {click.style(status, fg=color)} (confidence: {validation.confidence:.0%}) ---")
+
+    if validation.issues:
+        click.echo(click.style("Issues:", fg="yellow"))
+        for issue in validation.issues:
+            click.echo(f"  - {issue}")
+
+    if validation.suggestions:
+        click.echo(click.style("Suggestions:", fg="cyan"))
+        for suggestion in validation.suggestions:
+            click.echo(f"  - {suggestion}")
+
+
 def build_mr_details(
     vuln,
     jira_ticket: str,
@@ -229,8 +247,9 @@ def build_mr_details(
 @click.option("--dry-run", is_flag=True, help="Analyze without making changes")
 @click.option("--force", is_flag=True, help="Override existing branch and MR (only if you own them)")
 @click.option("--local-only", is_flag=True, help="Create local branch only, don't push or create MR")
+@click.option("--skip-validation", is_flag=True, help="Skip AI validation of the fix")
 @click.pass_context
-def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only):
+def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only, skip_validation):
     """Fix a specific vulnerability using Claude CLI.
 
     VULN_ID: The GitLab vulnerability ID to fix
@@ -412,7 +431,28 @@ def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only):
     files_to_report = modified_files or fix_result.files_modified
     click.echo(f"\nFiles modified: {', '.join(files_to_report)}")
 
-    # Step 6: Check confidence threshold
+    # Step 6: Validate the fix
+    if not skip_validation:
+        click.echo("\nValidating fix...")
+        # Extract CVE from identifiers if available
+        cve_id = next((i.split(":", 1)[1] for i in vuln.identifiers if i.startswith("CVE:")), None)
+        validation = agent.validate_fix(
+            fix=fix_result,
+            repo_path=repo_path,
+            vuln=vuln,
+            cve=cve_id
+        )
+        display_validation_result(validation)
+
+        if not validation.valid:
+            click.echo(click.style("\nValidation failed!", fg="red"))
+            if not click.confirm("Proceed anyway?"):
+                click.echo("Aborted.")
+                gl_client.checkout_branch(target_branch)
+                gl_client.delete_local_branch(branch_name, force=True)
+                return
+
+    # Step 7: Check confidence threshold
     min_confidence = config.get("options", {}).get("min_confidence", 0.7)
     if fix_result.confidence < min_confidence:
         click.echo(f"\nWarning: Confidence ({fix_result.confidence:.0%}) below threshold ({min_confidence:.0%})")
@@ -422,7 +462,7 @@ def fix(ctx, vuln_id, jira_ticket, dry_run, force, local_only):
             gl_client.delete_local_branch(branch_name, force=True)
             return
 
-    # Step 7: Commit changes
+    # Step 8: Commit changes
     commit_msg = f"{jira_ticket}: fix {vuln.title}\n\nAutomated fix by AI security agent"
 
     try:
@@ -595,8 +635,9 @@ def list_groups(ctx, severity, group_by):
 @click.option("--dry-run", is_flag=True, help="Analyze without making changes")
 @click.option("--force", is_flag=True, help="Override existing branch and MR (only if you own them)")
 @click.option("--local-only", is_flag=True, help="Create local branch only, don't push or create MR")
+@click.option("--skip-validation", is_flag=True, help="Skip AI validation of the fix")
 @click.pass_context
-def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
+def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only, skip_validation):
     """Fix all vulnerabilities for a specific CVE.
 
     CVE: The CVE identifier (e.g., CVE-2024-12798)
@@ -781,7 +822,27 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
     files_to_report = modified_files or fix_result.files_modified
     click.echo(f"\nFiles modified: {', '.join(files_to_report)}")
 
-    # Step 6: Check confidence threshold
+    # Step 6: Validate the fix
+    if not skip_validation:
+        click.echo("\nValidating fix...")
+        first_vuln = group[0]
+        validation = agent.validate_fix(
+            fix=fix_result,
+            repo_path=repo_path,
+            vuln=first_vuln,
+            cve=cve
+        )
+        display_validation_result(validation)
+
+        if not validation.valid:
+            click.echo(click.style("\nValidation failed!", fg="red"))
+            if not click.confirm("Proceed anyway?"):
+                click.echo("Aborted.")
+                gl_client.checkout_branch(target_branch)
+                gl_client.delete_local_branch(branch_name, force=True)
+                return
+
+    # Step 7: Check confidence threshold
     min_confidence = config.get("options", {}).get("min_confidence", 0.7)
     if fix_result.confidence < min_confidence:
         click.echo(f"\nWarning: Confidence ({fix_result.confidence:.0%}) below threshold ({min_confidence:.0%})")
@@ -791,7 +852,7 @@ def fix_group(ctx, cve, jira_ticket, severity, dry_run, force, local_only):
             gl_client.delete_local_branch(branch_name, force=True)
             return
 
-    # Step 7: Commit changes
+    # Step 8: Commit changes
     commit_msg = f"{jira_ticket}: fix {cve} - {group[0].title}\n\nAutomated fix by AI security agent"
 
     try:

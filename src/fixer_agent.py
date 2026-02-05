@@ -27,6 +27,14 @@ class ClaudeResult:
     error: str | None = None
 
 
+@dataclass
+class ValidationResult:
+    valid: bool
+    issues: list[str]
+    suggestions: list[str]
+    confidence: float  # 0-1, how confident the validator is
+
+
 class FixerAgent:
     """AI agent for analyzing and fixing vulnerabilities using Claude CLI."""
 
@@ -542,40 +550,208 @@ Provide:
 
         return explanation, min(max(confidence, 0.0), 1.0)
 
-    def validate_fix(self, fix: Fix, repo_path: Path) -> bool:
+    def validate_fix(
+        self,
+        fix: Fix,
+        repo_path: Path,
+        vuln: Vulnerability | None = None,
+        cve: str | None = None,
+    ) -> ValidationResult:
         """
-        Ask Claude to validate a fix doesn't break anything.
+        Validate a fix using Claude to check correctness and safety.
 
         Args:
             fix: The fix to validate
             repo_path: Path to the repository
+            vuln: Optional vulnerability details for context
+            cve: Optional CVE identifier
 
         Returns:
-            True if fix appears valid
+            ValidationResult with detailed validation info
         """
-        prompt = f"""
-Review this security fix for correctness:
+        # Get git diff for the actual changes
+        diff_result = subprocess.run(
+            ["git", "diff", "--staged"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True
+        )
+        git_diff = diff_result.stdout.strip()
 
-## File: {fix.file_path}
+        # If nothing staged, try unstaged diff
+        if not git_diff:
+            diff_result = subprocess.run(
+                ["git", "diff"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            git_diff = diff_result.stdout.strip()
 
-## Changes made:
-{fix.explanation}
+        # If still no diff (changes already committed), compare against main
+        if not git_diff:
+            diff_result = subprocess.run(
+                ["git", "diff", "main..HEAD"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            git_diff = diff_result.stdout.strip()
 
-## Instructions:
-1. Read the modified file
-2. Check for syntax errors
-3. Verify the fix addresses the security issue
-4. Check for any obvious bugs introduced
-
-Respond with:
-- VALID: yes or no
-- ISSUES: any problems found (or "none")
+        # Build context about what we're fixing
+        vuln_context = ""
+        if vuln:
+            vuln_context = f"""
+## Vulnerability Details
+- **CVE/ID**: {cve or vuln.id}
+- **Title**: {vuln.title}
+- **Severity**: {vuln.severity.value}
+- **Type**: {vuln.vuln_type.value}
+- **Package**: {vuln.location.dependency or 'N/A'}
+- **Description**: {vuln.description[:500] if vuln.description else 'N/A'}
+- **Expected Solution**: {vuln.solution or 'Upgrade to patched version'}
+"""
+        elif cve:
+            vuln_context = f"""
+## Vulnerability
+- **CVE**: {cve}
 """
 
-        result = self._run_claude(prompt, repo_path)
+        # Determine fix type for specific validation
+        is_dependency_fix = any(
+            f.endswith(('.gradle', '.gradle.kts', 'pom.xml', 'package.json',
+                       'requirements.txt', 'pyproject.toml', 'Gemfile', 'go.mod'))
+            for f in fix.files_modified
+        )
+
+        if is_dependency_fix:
+            specific_checks = """
+### Dependency-Specific Checks
+1. **Version Validity**: Is the new version a real, published version?
+2. **Version Safety**: Does this version actually fix the CVE? (check if version >= known fixed version)
+3. **Compatibility**: Could this version conflict with other dependencies (e.g., Spring Boot BOM, parent POMs)?
+4. **Syntax**: Is the build file syntax correct (Gradle Kotlin DSL, Maven XML, etc.)?
+5. **Scope**: Does the fix apply to the correct dependency (group:artifact)?
+6. **Approach**: Is using constraints/dependencyManagement the right approach, or should the direct dependency be updated?
+"""
+        else:
+            specific_checks = """
+### Code-Specific Checks
+1. **Syntax**: Does the code compile/parse correctly?
+2. **Logic**: Does the fix actually prevent the vulnerability?
+3. **Side Effects**: Could this change break existing functionality?
+4. **Completeness**: Are all vulnerable code paths fixed?
+5. **Style**: Does the fix match existing code style?
+"""
+
+        prompt = f"""
+You are a security code reviewer. Validate this fix for correctness and safety.
+
+{vuln_context}
+
+## Changes Made (git diff)
+```diff
+{git_diff if git_diff else "No diff available - files may not be tracked yet"}
+```
+
+## Fix Explanation
+{fix.explanation}
+
+## Files Modified
+{', '.join(fix.files_modified) if fix.files_modified else 'Unknown'}
+
+{specific_checks}
+
+## Your Task
+1. Read the modified files to see the full context
+2. Verify the fix is correct and complete
+3. Check for any issues or concerns
+
+## Response Format (REQUIRED)
+You MUST respond with these exact sections:
+
+VALID: yes or no
+
+CONFIDENCE: 0.0-1.0
+
+ISSUES:
+- List any problems found (or "none")
+
+SUGGESTIONS:
+- List any improvements (or "none")
+
+REASONING:
+Brief explanation of your assessment
+"""
+
+        result = self._run_claude(prompt, repo_path, verbose=False)
 
         if not result.success:
-            return False
+            return ValidationResult(
+                valid=False,
+                issues=[f"Validation failed: {result.error}"],
+                suggestions=[],
+                confidence=0.0
+            )
 
-        output_lower = result.output.lower()
-        return "valid: yes" in output_lower or "valid:yes" in output_lower
+        return self._parse_validation_output(result.output)
+
+    def _parse_validation_output(self, output: str) -> ValidationResult:
+        """Parse validation output into structured result."""
+        # Remove markdown formatting for easier parsing
+        output_clean = re.sub(r'\*+', '', output)  # Remove asterisks
+        output_lower = output_clean.lower()
+
+        # Parse VALID (handles "VALID: yes", "**VALID**: yes", etc.)
+        valid = False
+        valid_match = re.search(r"valid[:\s]+\**(yes|no)\**", output_lower)
+        if valid_match:
+            valid = valid_match.group(1) == "yes"
+
+        # Parse CONFIDENCE (handles "CONFIDENCE: 0.95", "**CONFIDENCE**: 0.95", etc.)
+        confidence = 0.7  # default
+        conf_match = re.search(r"confidence[:\s]*\**(\d+\.?\d*)", output_lower)
+        if conf_match:
+            try:
+                confidence = float(conf_match.group(1))
+                if confidence > 1:
+                    confidence = confidence / 100
+            except ValueError:
+                pass
+
+        # Parse ISSUES
+        issues = []
+        issues_match = re.search(
+            r"issues[:\s]*\n(.*?)(?=suggestions|reasoning|$)",
+            output,
+            re.IGNORECASE | re.DOTALL
+        )
+        if issues_match:
+            issues_text = issues_match.group(1).strip()
+            if issues_text.lower() != "none" and issues_text != "-":
+                for line in issues_text.split("\n"):
+                    line = line.strip().lstrip("-•*").strip()
+                    if line and line.lower() != "none":
+                        issues.append(line)
+
+        # Parse SUGGESTIONS
+        suggestions = []
+        suggestions_match = re.search(
+            r"suggestions[:\s]*\n(.*?)(?=reasoning|$)",
+            output,
+            re.IGNORECASE | re.DOTALL
+        )
+        if suggestions_match:
+            suggestions_text = suggestions_match.group(1).strip()
+            if suggestions_text.lower() != "none" and suggestions_text != "-":
+                for line in suggestions_text.split("\n"):
+                    line = line.strip().lstrip("-•*").strip()
+                    if line and line.lower() != "none":
+                        suggestions.append(line)
+
+        return ValidationResult(
+            valid=valid,
+            issues=issues,
+            suggestions=suggestions,
+            confidence=min(max(confidence, 0.0), 1.0)
+        )

@@ -389,10 +389,13 @@ You are a security expert. {action.capitalize()} this dependency vulnerability:
 
 ## CRITICAL: Scope Limitation
 You are ONLY fixing the vulnerability in package: {package_name}
-- DO NOT fix any other vulnerabilities or packages
-- DO NOT update any other dependencies, even if they appear vulnerable
-- ONLY modify the {package_name} package
+- DO NOT fix any other vulnerabilities or CVEs
+- DO NOT update unrelated dependencies, even if they appear vulnerable
 - If you see other vulnerabilities, IGNORE them - they will be fixed separately
+- **EXCEPTION**: You MUST also upgrade **sibling artifacts from the same group** to keep them
+  in sync. For example, if fixing `ch.qos.logback:logback-core`, also upgrade
+  `ch.qos.logback:logback-classic` to the same version. Mismatched versions within the same
+  artifact group cause runtime errors.
 
 ## Instructions
 
@@ -593,9 +596,12 @@ You are a security expert. {action.capitalize()} this CVE across ALL affected fi
 ## CRITICAL: Scope Limitation
 You are ONLY fixing {cve} which affects the package(s): {packages_str}
 - DO NOT fix any other vulnerabilities or CVEs
-- DO NOT update any other packages, even if they appear vulnerable
-- ONLY modify the specific package(s) listed above
+- DO NOT update unrelated dependencies, even if they appear vulnerable
 - If you see other vulnerabilities, IGNORE them - they will be fixed separately
+- **EXCEPTION**: You MUST also upgrade **sibling artifacts from the same group** to keep them
+  in sync. For example, if fixing `ch.qos.logback:logback-core`, also upgrade
+  `ch.qos.logback:logback-classic` to the same version. Mismatched versions within the same
+  artifact group cause runtime errors.
 
 ## Instructions
 
